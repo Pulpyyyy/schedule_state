@@ -427,6 +427,7 @@ class ScheduleSensor(SensorEntity, RestoreEntity):
         """Initialize the sensor."""
         self.data = data
         self._attributes = {}
+        self._self_recalc_count = 0
         self._name = name
         self._state = None
 
@@ -453,14 +454,53 @@ class ScheduleSensor(SensorEntity, RestoreEntity):
                     EVENT_HOMEASSISTANT_START, schedule_start_hass
                 )
 
+        # A template may legitimately reference this sensor's own entity_id
+        # (e.g. state_attr(<self>, 'over_head')). This is supported: the
+        # schedule is re-evaluated on our own state_changed until it reaches a
+        # fixed point. Combined with the schedule fingerprint, a converging
+        # self-reference settles in a couple of immediate iterations and then
+        # goes quiet. SELF_RECALC_LIMIT bounds the iteration so a template that
+        # oscillates instead of converging cannot spin forever at the poll rate.
+        SELF_RECALC_LIMIT = 5
+
+        def significant_attrs():
+            # "last_update" is bookkeeping rather than schedule content:
+            # including it would make every recalculation look like a change.
+            return {k: v for k, v in self._attributes.items() if k != "last_update"}
+
         @callback
         async def recalc_callback(*args):
             _LOGGER.debug(f"{self.data.name}: something changed {args}")
+
+            triggered_by_self = bool(
+                args
+                and getattr(args[0], "data", None)
+                and args[0].data.get("entity_id") == self.entity_id
+            )
+            if triggered_by_self:
+                self._self_recalc_count += 1
+                if self._self_recalc_count > SELF_RECALC_LIMIT:
+                    _LOGGER.error(
+                        f"{self.data.name}: self-referencing template did not "
+                        f"converge after {SELF_RECALC_LIMIT} iterations - backing "
+                        f"off until an external entity changes. Check templates "
+                        f"referencing {self.entity_id}."
+                    )
+                    return
+            else:
+                self._self_recalc_count = 0
+
             old_state = self._state
-            old_attrs = self.data.extra_attributes
+            # Compare the computed attributes, not self.data.extra_attributes:
+            # the latter is the static YAML config and never changes, so this
+            # guard could only ever react to a state change.
+            old_attrs = significant_attrs()
             await self.data.process_events()
             await self.async_update()
-            if self._state != old_state or self.data.extra_attributes != old_attrs:
+            if self._state != old_state or significant_attrs() != old_attrs:
+                # Write immediately instead of waiting for the next platform
+                # poll, so a self-reference converges in milliseconds rather
+                # than one poll interval per iteration.
                 self.schedule_update_ha_state(force_refresh=True)
 
         if len(self.data.entities):
@@ -627,7 +667,30 @@ class ScheduleSensorData:
         self.events_list = []  # Raw list of events
         self.total_events_count = 0  # Total event counter
         self.last_update_time = None  # Update timestamp
+        self._schedule_fingerprint = None  # Snapshot of the last computed schedule
         self.room_name = config.get(CONF_NAME)  # Room/zone name
+
+    def _fingerprint(self, states, icons, attrs):
+        """Return a comparable snapshot of the freshly computed schedule.
+
+        Returns None if the snapshot cannot be built, in which case the caller
+        falls back to the previous behaviour of always stamping.
+        """
+        try:
+
+            def snap(idict):
+                return sorted((str(k), repr(v)) for k, v in idict.items())
+
+            return (
+                snap(states),
+                snap(icons),
+                sorted((k, snap(v)) for k, v in attrs.items()),
+                self.layers_by_day,
+                self.events_list,
+            )
+        except Exception as e:  # noqa: BLE001 - must never break a refresh
+            _LOGGER.debug(f"{self.name}: could not fingerprint schedule: {e}")
+            return None
 
     async def process_events(self):
         """Process the list of events and derive the schedule for the day."""
@@ -803,7 +866,15 @@ class ScheduleSensorData:
         self.total_events_count = sum(
             len(layers) for layers in self.layers_by_day.values()
         )
-        self.last_update_time = dt.as_local(dt_now()).isoformat()
+        # Only stamp last_update_time when the recomputed schedule actually
+        # differs. process_events() runs on every refresh and on every tracked-
+        # entity change; stamping unconditionally mutated the exposed
+        # "last_update" attribute each time, so HA emitted a state_changed event
+        # and the recorder stored a duplicate row.
+        fingerprint = self._fingerprint(states, icons, attrs)
+        if fingerprint is None or fingerprint != self._schedule_fingerprint:
+            self._schedule_fingerprint = fingerprint
+            self.last_update_time = dt.as_local(dt_now()).isoformat()
         _LOGGER.info(
             f"\n{pformat(dict(name=self.name, states=states, icons=icons, attrs=attrs))}"
         )
